@@ -1,0 +1,18 @@
+Manifest-Version: 1.0
+Created-By: 21.0.10 (N/A)
+
+Name: split_config.xhdpi.apk
+SHA1-Digest: TICmbNHVHnDpWIKKcv7kykwexvI=
+
+Name: icon.png
+SHA1-Digest: IWmjEaBOm41cNLa+qEHU+KuDzkE=
+
+Name: APKM_installer.url
+SHA1-Digest: WXG2Fx7AAOCZOW45becgkaGPhgg=
+
+Name: info.json
+SHA1-Digest: 8MaRZjkv6Ou07n0LYOijZ7mXCHs=
+
+Name: base.apk
+SHA1-Digest: S+CvqMXykiQFEdsLCxXPzRmWCps=
+

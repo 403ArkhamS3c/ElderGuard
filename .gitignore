@@ -1,0 +1,29 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# Android Studio
+local.properties
+*.iml
+.idea/
+
+# Python backend (same repo)
+__pycache__/
+venv/
+*.pyc
+
+# Generated runtime logs & sensor data
+*.log
+*_log.csv
+raw_sensor_log.csv
+candidate_audit_log.csv
+event_detection_log.csv
+event_response_log.csv
+*.bak
+
+# Notes / scratch files (root-level only)
+/note*.txt
+
+# Kredensial lokal (jangan di-commit)
+WearOS/Note/pass-database.txt

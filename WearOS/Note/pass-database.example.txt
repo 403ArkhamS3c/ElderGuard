@@ -1,0 +1,1 @@
+# Salin file ini menjadi pass-database.txt lalu isi kata sandi lokal (file asli tidak di-commit).

@@ -1,0 +1,25 @@
+{
+    "apkm_version": 5,
+    "apk_title": "Sensors Toolbox (Wear OS) 1.0.05.W",
+    "app_name": "Sensors Toolbox (Wear OS)",
+    "release_version": "1.0.05.W",
+    "variant": "(320dpi) (Android 7.1+)",
+    "release_title": "Sensors Toolbox (Wear OS) 1.0.05.W",
+    "versioncode": "67",
+    "pname": "com.exatools.sensors",
+    "post_date": "2026-05-09 05:20:47",
+    "capabilities": [
+        "wear_standalone"
+    ],
+    "languages": [
+        "pl"
+    ],
+    "arches": [],
+    "dpis": [
+        "320"
+    ],
+    "min_api": "25",
+    "accent_color": "2490bc",
+    "apk_id": 13728642,
+    "release_id": 13728643
+}
