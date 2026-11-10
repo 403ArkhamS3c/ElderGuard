@@ -50,7 +50,7 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     private val client = OkHttpClient()
-    private val serverEvaluateUrl = "http://10.94.53.214:8000/api/events/evaluate"
+    private val serverEvaluateUrl = "https://elderguard.fly.dev/api/events/evaluate"
 
     // UI Utama
     private lateinit var layoutMain: LinearLayout
