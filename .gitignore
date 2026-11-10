@@ -27,3 +27,8 @@ event_response_log.csv
 
 # Kredensial lokal (jangan di-commit)
 WearOS/Note/pass-database.txt
+
+# Environment variables (rahasia - jangan di-commit)
+.env
+.env.*
+!.env.example
