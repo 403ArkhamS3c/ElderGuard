@@ -5,6 +5,7 @@ import math
 import uuid
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -43,13 +44,13 @@ app = FastAPI(title="ElderGuard Cloud API - Official Blueprint v1.0 Compliance")
 # =====================================================================
 # SYSTEM SPECIFICATIONS (BLUEPRINT v1.0 & IT BRIEF v1.0)
 # =====================================================================
-SAMPLING_RATE_HZ = 50                     # Target 50 Hz[cite: 3, 4]
-POST_EVENT_WINDOW_SEC = 3                 # 3 seconds observation window[cite: 3, 4]
-EXPECTED_SAMPLES = SAMPLING_RATE_HZ * POST_EVENT_WINDOW_SEC  # 150 samples[cite: 3, 4]
+SAMPLING_RATE_HZ = 50                     # Target 50 Hz[cite: 3]
+POST_EVENT_WINDOW_SEC = 3                 # 3 seconds observation window[cite: 3]
+EXPECTED_SAMPLES = SAMPLING_RATE_HZ * POST_EVENT_WINDOW_SEC  # 150 samples[cite: 3]
 
-TRIGGER_THRESHOLD_G = 2.0                 # Dynamic acceleration trigger threshold[cite: 4]
-FALL_IMPACT_THRESHOLD_G = 2.3             # Resultant acceleration fall threshold[cite: 4]
-FALL_INACTIVITY_THRESHOLD_G = 0.2         # Inactivity dynamic acceleration limit[cite: 4]
+TRIGGER_THRESHOLD_G = 2.0                 # Dynamic acceleration trigger threshold
+FALL_IMPACT_THRESHOLD_G = 2.3             # Resultant acceleration fall threshold
+FALL_INACTIVITY_THRESHOLD_G = 0.2         # Inactivity dynamic acceleration limit
 
 EVENT_LOG_FILE = "elderguard_official_log.csv"
 
@@ -66,6 +67,15 @@ EVENT_FIELDS = [
     "caregiver_notification_status",
     "reason",
 ]
+
+# Global cache untuk menyimpan event deteksi terakhir (untuk endpoint /latest)
+latest_event_cache = {
+    "event_id": "EVT-NONE",
+    "event_type": "NORMAL",
+    "timestamp": int(time.time()),
+    "peak_acceleration": 1.0,
+    "user_id": "00000000-0000-0000-0000-000000000000"
+}
 
 def init_csv_logs() -> None:
     if not os.path.exists(EVENT_LOG_FILE):
@@ -98,7 +108,7 @@ def classify_event_rule_based(x_vals: List[float], y_vals: List[float], z_vals: 
     if n == 0:
         raise ValueError("Data sensor kosong")
 
-    # 1. Resultant Acceleration Calculation (A_r = sqrt(ax^2 + ay^2 + az^2))[cite: 3, 4]
+    # 1. Resultant Acceleration Calculation (A_r = sqrt(ax^2 + ay^2 + az^2))[cite: 3]
     resultant_g_vals = []
     for i in range(n):
         ax, ay, az = x_vals[i], y_vals[i], z_vals[i]
@@ -107,24 +117,24 @@ def classify_event_rule_based(x_vals: List[float], y_vals: List[float], z_vals: 
 
     peak_acceleration = max(resultant_g_vals)
 
-    # 2. Gravity Estimation & Dynamic Acceleration Calculation[cite: 3, 4]
+    # 2. Gravity Estimation & Dynamic Acceleration Calculation[cite: 3]
     gravity_est = sum(resultant_g_vals) / n
     dynamic_g_vals = [abs(val - gravity_est) for val in resultant_g_vals]
     peak_dynamic_g = max(dynamic_g_vals)
 
-    # 3. Acceleration Variability & Post-Activity Feature Extraction[cite: 3, 4]
+    # 3. Acceleration Variability & Post-Activity Feature Extraction[cite: 3]
     mean_dynamic = sum(dynamic_g_vals) / n
     variability = sum((dg - mean_dynamic) ** 2 for dg in dynamic_g_vals) / n
     
-    # Post-trigger wrist activity (aktivitas di bagian akhir observation window)[cite: 3, 4]
+    # Post-trigger wrist activity (aktivitas di bagian akhir observation window)[cite: 3]
     late_window = dynamic_g_vals[n // 2:]
     post_activity = sum(late_window) / len(late_window) if late_window else 0.0
 
-    # Filter Isolated Impact (misal: mengetuk meja / waving tajam)[cite: 3, 4]
+    # Filter Isolated Impact (misal: mengetuk meja / waving tajam)[cite: 3]
     high_dynamic_count = sum(1 for dg in dynamic_g_vals if dg >= 1.2)
     is_isolated_impact = (peak_dynamic_g >= 2.0) and (high_dynamic_count < 3)
 
-    # 4. Post-Event Inactivity Evaluation for Fall[cite: 3, 4]
+    # 4. Post-Event Inactivity Evaluation for Fall[cite: 3]
     consecutive_low_dynamic = 0
     max_consecutive_low = 0
     for dg in dynamic_g_vals:
@@ -138,7 +148,7 @@ def classify_event_rule_based(x_vals: List[float], y_vals: List[float], z_vals: 
     inactivity_duration_achieved = max_consecutive_low / float(SAMPLING_RATE_HZ)
     is_fall = (peak_acceleration >= FALL_IMPACT_THRESHOLD_G) and (inactivity_duration_achieved >= 0.8)
 
-    # --- CLASSIFICATION PRIORITY: FALL -> NEAR_FALL -> NORMAL[cite: 3, 4] ---
+    # --- CLASSIFICATION PRIORITY: FALL -> NEAR_FALL -> NORMAL[cite: 3] ---
     if is_fall:
         return {
             "event_type": "FALL",
@@ -148,7 +158,7 @@ def classify_event_rule_based(x_vals: List[float], y_vals: List[float], z_vals: 
             "reason": f"Fall terdeteksi: Peak={peak_acceleration:.2f}G, Inactivity={inactivity_duration_achieved:.3f}s."
         }
 
-    # NEAR_FALL Evaluation[cite: 3, 4]
+    # NEAR_FALL Evaluation[cite: 3]
     has_sudden_movement = peak_dynamic_g >= 1.5
     has_instability = variability >= 0.05 and peak_acceleration >= 2.2
     has_sustained_disturbance = high_dynamic_count >= 5
@@ -162,7 +172,7 @@ def classify_event_rule_based(x_vals: List[float], y_vals: List[float], z_vals: 
             "reason": f"Near-Fall terdeteksi: Variabilitas={variability:.3f}, Peak={peak_acceleration:.2f}G"
         }
 
-    # NORMAL[cite: 3, 4]
+    # NORMAL[cite: 3]
     return {
         "event_type": "NORMAL",
         "peak_acceleration": round(peak_acceleration, 3),
@@ -190,6 +200,8 @@ class EventPacket(BaseModel):
 
 @app.post("/api/events/evaluate")
 async def evaluate_event(packet: EventPacket):
+    global latest_event_cache
+
     x = packet.observation_window.x
     y = packet.observation_window.y
     z = packet.observation_window.z
@@ -202,17 +214,27 @@ async def evaluate_event(packet: EventPacket):
     device_id = packet.device_id
     timestamp_str = packet.timestamp or datetime.now(timezone.utc).isoformat()
 
-    # Jalankan klasifikasi rule-based sesuai blueprint[cite: 3, 4]
+    # Jalankan klasifikasi rule-based sesuai blueprint[cite: 3]
     result = classify_event_rule_based(x_vals=x, y_vals=y, z_vals=z)
     event_type = result["event_type"]
 
-    # Pemisahan Status Sesuai Blueprint & IT Brief[cite: 3, 4]
+    # Pemisahan Status Sesuai Blueprint & IT Brief[cite: 3]
     if event_type == "NORMAL":
         confirmation_status = "NOT_REQUIRED"
         notification_status = "NOT_REQUIRED"
     else:
-        confirmation_status = "PENDING"  # Memerlukan human confirmation (30s timeout)[cite: 3, 4]
+        confirmation_status = "PENDING"  # Memerlukan human confirmation (30s timeout)[cite: 3]
         notification_status = "PENDING"
+
+    # Perbarui Cache Global untuk endpoint /api/monitoring/latest
+    current_unix_time = int(datetime.now(timezone.utc).timestamp())
+    latest_event_cache = {
+        "event_id": event_id,
+        "event_type": event_type,
+        "timestamp": current_unix_time,
+        "peak_acceleration": result["peak_acceleration"],
+        "user_id": user_id
+    }
 
     log.info(
         "[EVALUATE] id=%s | Type=%s | Peak=%.2fG | Var=%.4f | ConfStatus=%s | NotifStatus=%s",
@@ -224,7 +246,7 @@ async def evaluate_event(packet: EventPacket):
         notification_status,
     )
 
-    # 1. Simpan ke CSV Log Lokal[cite: 3, 4]
+    # 1. Simpan ke CSV Log Lokal[cite: 3]
     append_csv([
         event_id,
         user_id,
@@ -239,7 +261,7 @@ async def evaluate_event(packet: EventPacket):
         result["reason"],
     ])
 
-    # 2. Sinkronisasi ke Supabase Database (`events` table schema compliance)[cite: 3, 4]
+    # 2. Sinkronisasi ke Supabase Database (`events` table schema compliance)[cite: 3]
     await db_insert("events", {
         "id": event_id,
         "user_id": user_id,
@@ -264,6 +286,14 @@ async def evaluate_event(packet: EventPacket):
         "variability": result["variability"],
         "reason": result["reason"],
     }
+
+
+@app.get("/api/monitoring/latest")
+async def get_latest_monitoring():
+    """
+    Mengembalikan data deteksi kejadian terbaru untuk pemantauan pada aplikasi Android (Caregiver/Frontend).
+    """
+    return latest_event_cache
 
 
 @app.get("/health")
