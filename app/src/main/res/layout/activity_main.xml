@@ -3,11 +3,9 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#0D1117"
-    android:padding="18dp">
+    android:padding="16dp">
 
-    <!-- ========================================== -->
-    <!-- LAYAR 1: TAMPILAN UTAMA MONITORING         -->
-    <!-- ========================================== -->
+    <!-- LAYAR MONITORING UTAMA -->
     <LinearLayout
         android:id="@+id/layoutMain"
         android:layout_width="match_parent"
@@ -15,7 +13,6 @@
         android:gravity="center"
         android:orientation="vertical">
 
-        <!-- Judul Aplikasi -->
         <TextView
             android:id="@+id/tvAppTitle"
             android:layout_width="wrap_content"
@@ -26,19 +23,17 @@
             android:textSize="11sp"
             android:textStyle="bold" />
 
-        <!-- Status Koneksi & Monitoring -->
         <TextView
             android:id="@+id/tvStatus"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
             android:gravity="center"
-            android:text="Disconnected"
+            android:text="Ready"
             android:textColor="#FFFFFF"
-            android:textSize="14sp"
+            android:textSize="13sp"
             android:textStyle="bold" />
 
-        <!-- Kotak Indikator Sensor Live (ACC & Barometer) -->
         <TextView
             android:id="@+id/tvMetrics"
             android:layout_width="wrap_content"
@@ -47,46 +42,39 @@
             android:layout_marginBottom="10dp"
             android:background="#161B22"
             android:gravity="center"
-            android:paddingHorizontal="12dp"
+            android:paddingHorizontal="10dp"
             android:paddingVertical="4dp"
-            android:text="ACC: 0.00 G  |  P: -- hPa"
+            android:text="SVM: 1.00g | Buffer: 0/200"
             android:textColor="#8B949E"
-            android:textSize="11sp" />
+            android:textSize="10sp" />
 
-        <!-- Tombol START (Hijau) -->
         <Button
             android:id="@+id/btnStart"
-            android:layout_width="135dp"
-            android:layout_height="40dp"
+            android:layout_width="130dp"
+            android:layout_height="38dp"
             android:backgroundTint="#238636"
             android:text="START"
             android:textColor="#FFFFFF"
-            android:textSize="13sp"
+            android:textSize="12sp"
             android:textStyle="bold" />
 
-        <!-- Tombol STOP (Abu-abu/Merah - Hanya muncul saat sensor berjalan) -->
         <Button
             android:id="@+id/btnStop"
-            android:layout_width="135dp"
-            android:layout_height="40dp"
+            android:layout_width="130dp"
+            android:layout_height="38dp"
             android:backgroundTint="#DA3633"
-            android:enabled="false"
             android:text="STOP"
             android:textColor="#FFFFFF"
-            android:textSize="13sp"
+            android:textSize="12sp"
             android:textStyle="bold"
             android:visibility="gone" />
-
     </LinearLayout>
 
-    <!-- ========================================== -->
-    <!-- LAYAR 2: LAYAR KONFIRMASI (FALL/NEAR-FALL) -->
-    <!-- ========================================== -->
+    <!-- LAYAR HUMAN-IN-THE-LOOP CONFIRMATION -->
     <LinearLayout
         android:id="@+id/layoutAlert"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="#0D1117"
         android:gravity="center"
         android:orientation="vertical"
         android:visibility="gone">
@@ -96,9 +84,9 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:gravity="center"
-            android:text="NEAR-FALL DETECTED"
+            android:text="PROMPT TITLE"
             android:textColor="#F85149"
-            android:textSize="13sp"
+            android:textSize="12sp"
             android:textStyle="bold" />
 
         <TextView
@@ -108,33 +96,29 @@
             android:layout_marginTop="2dp"
             android:layout_marginBottom="8dp"
             android:gravity="center"
-            android:text="Are you OK? (15s)"
+            android:text="00s"
             android:textColor="#E6EDF3"
-            android:textSize="12sp" />
+            android:textSize="11sp" />
 
-        <!-- Tombol Besar I'M OK (Hijau Terang) -->
         <Button
             android:id="@+id/btnOk"
-            android:layout_width="145dp"
-            android:layout_height="42dp"
+            android:layout_width="140dp"
+            android:layout_height="40dp"
             android:layout_marginBottom="6dp"
             android:backgroundTint="#2EA043"
-            android:text="I'M OK"
+            android:text="YES / OK"
             android:textColor="#FFFFFF"
-            android:textSize="13sp"
+            android:textSize="12sp"
             android:textStyle="bold" />
 
-        <!-- Tombol Besar NEED HELP (Merah Terang) -->
         <Button
             android:id="@+id/btnHelp"
-            android:layout_width="145dp"
-            android:layout_height="42dp"
+            android:layout_width="140dp"
+            android:layout_height="40dp"
             android:backgroundTint="#DA3633"
-            android:text="NEED HELP"
+            android:text="NO / HELP"
             android:textColor="#FFFFFF"
-            android:textSize="13sp"
+            android:textSize="12sp"
             android:textStyle="bold" />
-
     </LinearLayout>
-
 </FrameLayout>

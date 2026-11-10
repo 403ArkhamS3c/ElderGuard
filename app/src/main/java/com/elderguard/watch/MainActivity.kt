@@ -7,8 +7,12 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.util.Log
 import android.view.View
 import android.view.WindowManager
@@ -18,100 +22,104 @@ import android.widget.TextView
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.Timer
 import java.util.TimerTask
-import java.util.concurrent.TimeUnit
+import java.util.UUID
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 class MainActivity : Activity(), SensorEventListener {
 
     companion object {
-        private const val TAG = "ELDER_DEBUG"
+        private const val TAG = "ELDERGUARD_WATCH"
+        
+        // Spesifikasi Resmi Blueprint v1.0 & IT Brief v1.0
+        private const val SAMPLING_RATE_HZ = 50                     // Target 50 Hz[cite: 3, 4]
+        private const val SAMPLE_INTERVAL_MS = 20L                  // ~20 ms interval[cite: 4]
+        private const val OBSERVATION_WINDOW_SEC = 3                // 3 detik observation window[cite: 3, 4]
+        private const val TARGET_SAMPLES = SAMPLING_RATE_HZ * OBSERVATION_WINDOW_SEC // 150 sampel[cite: 3, 4]
+        private const val TRIGGER_THRESHOLD_G = 2.0                 // Dynamic acceleration trigger[cite: 4]
+        
+        private const val GRAVITY_ALPHA = 0.0353f                   // Low-pass filter ~0.3 Hz
     }
 
-    // --- Konfigurasi Jaringan ---
-    private var webSocket: WebSocket? = null
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)
-        .build()
+    private val client = OkHttpClient()
+    private val serverEvaluateUrl = "http://10.94.53.214:8000/api/events/evaluate"
 
-    private val serverWsUrl = "ws://192.168.0.133:8000/ws/sensor/S01"
-    private val serverHttpUrl = "http://192.168.0.133:8000/api/events/confirm"
-
-    // --- Status Internal ---
-    @Volatile private var isWsConnected = false
-    @Volatile private var isSensorRunning = false
-    @Volatile private var isWaitingUserResponse = false
-
-    private var countdownTimer: CountDownTimer? = null
-
-    // --- Komponen UI Utama ---
+    // UI Utama
     private lateinit var layoutMain: LinearLayout
     private lateinit var tvStatus: TextView
     private lateinit var tvMetrics: TextView
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
 
-    // --- Komponen UI Konfirmasi (Post-Event Response) ---
+    // UI Human Confirmation (30s Timeout)[cite: 3, 4]
     private lateinit var layoutAlert: LinearLayout
     private lateinit var tvAlertTitle: TextView
     private lateinit var tvAlertTimer: TextView
-    private lateinit var btnOk: Button
-    private lateinit var btnHelp: Button
+    private lateinit var btnYes: Button
+    private lateinit var btnNo: Button
 
-    // --- Konfigurasi Sensor ---
     private lateinit var sensorManager: SensorManager
     private var accelerometer: Sensor? = null
-    private var barometer: Sensor? = null
+    private var vibrator: Vibrator? = null
+
+    @Volatile private var isMonitoring = false
+    @Volatile private var isObservingWindow = false
+    @Volatile private var isUserResponding = false
 
     @Volatile private var currentAx = 0f
     @Volatile private var currentAy = 0f
     @Volatile private var currentAz = 0f
-    @Volatile private var currentPressure = 0f
 
-    private var streamingTimer: Timer? = null
-    private var packetCounter = 0
+    private var estimatedGravity = 1.0f
+    private val observationSamples = ArrayList<SensorSample>()
+
+    private data class SensorSample(val x: Float, val y: Float, val z: Float, val timestamp: Long)
+
+    private var samplingTimer: Timer? = null
+    private var countDownTimer: CountDownTimer? = null
+    private var uiTick = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Inisialisasi UI Utama
         layoutMain = findViewById(R.id.layoutMain)
         tvStatus = findViewById(R.id.tvStatus)
         tvMetrics = findViewById(R.id.tvMetrics)
         btnStart = findViewById(R.id.btnStart)
         btnStop = findViewById(R.id.btnStop)
 
-        // Inisialisasi UI Alert
         layoutAlert = findViewById(R.id.layoutAlert)
         tvAlertTitle = findViewById(R.id.tvAlertTitle)
         tvAlertTimer = findViewById(R.id.tvAlertTimer)
-        btnOk = findViewById(R.id.btnOk)
-        btnHelp = findViewById(R.id.btnHelp)
+        btnYes = findViewById(R.id.btnOk)
+        btnNo = findViewById(R.id.btnHelp)
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        barometer = sensorManager.getDefaultSensor(Sensor.TYPE_PRESSURE)
-
-        connectWebSocket()
-
-        btnStart.setOnClickListener {
-            if (!isWsConnected) {
-                setStatusUi("Reconnecting...", "#D29922")
-                connectWebSocket()
-            }
-            startSensorsManually()
+        
+        vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+            vibratorManager.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
 
-        btnStop.setOnClickListener {
-            stopSensorsManually()
-        }
+        setStatusUi("Ready (50 Hz)", "#FFFFFF")
+        tvMetrics.text = "A_dynamic: 0.00G | Monitoring"
+
+        btnStart.setOnClickListener { startMonitoring() }
+        btnStop.setOnClickListener { stopMonitoring() }
     }
 
     private fun setStatusUi(text: String, hexColor: String) {
@@ -121,214 +129,252 @@ class MainActivity : Activity(), SensorEventListener {
         }
     }
 
-    private fun startSensorsManually() {
-        if (isSensorRunning) return
-        isSensorRunning = true
-        isWaitingUserResponse = false
-        packetCounter = 0
+    private fun startMonitoring() {
+        if (isMonitoring) return
+        isMonitoring = true
+        isObservingWindow = false
+        isUserResponding = false
+        observationSamples.clear()
+        estimatedGravity = 1.0f
 
-        val samplingPeriodUs = 40_000 // 25 Hz
-        accelerometer?.let { sensorManager.registerListener(this, it, samplingPeriodUs) }
-        barometer?.let { sensorManager.registerListener(this, it, samplingPeriodUs) }
+        accelerometer?.let {
+            sensorManager.registerListener(this, it, 20_000) // 50 Hz
+        }
 
-        startStreamingData()
+        startSamplingLoop()
 
-        // Sembunyikan tombol START, tampilkan tombol STOP di tempat yang sama
         btnStart.visibility = View.GONE
         btnStop.visibility = View.VISIBLE
         btnStop.isEnabled = true
-        setStatusUi("Monitoring Active", "#3FB950")
+        setStatusUi("Monitoring (50 Hz)", "#3FB950")
     }
 
-    private fun stopSensorsManually() {
-        isSensorRunning = false
-        isWaitingUserResponse = false
+    private fun stopMonitoring() {
+        isMonitoring = false
+        isObservingWindow = false
+        isUserResponding = false
 
         sensorManager.unregisterListener(this)
-        stopStreamingData()
+        samplingTimer?.cancel()
+        samplingTimer = null
+        countDownTimer?.cancel()
 
-        // Tampilkan kembali tombol START, sembunyikan tombol STOP
         btnStop.visibility = View.GONE
         btnStart.visibility = View.VISIBLE
         btnStart.isEnabled = true
-        tvMetrics.text = "ACC: 0.00 G  |  P: -- hPa"
-
-        if (isWsConnected) {
-            setStatusUi("Ready to Start", "#FFFFFF")
-        } else {
-            setStatusUi("Disconnected", "#F85149")
-        }
+        setStatusUi("Stopped", "#F85149")
+        tvMetrics.text = "A_dynamic: 0.00G | Stopped"
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
-        if (event == null) return
-        when (event.sensor.type) {
-            Sensor.TYPE_ACCELEROMETER -> {
-                currentAx = event.values[0]
-                currentAy = event.values[1]
-                currentAz = event.values[2]
-            }
-            Sensor.TYPE_PRESSURE -> {
-                currentPressure = event.values[0]
-            }
+        if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
+            currentAx = event.values[0]
+            currentAy = event.values[1]
+            currentAz = event.values[2]
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-    private fun startStreamingData() {
-        if (streamingTimer != null) return
-
-        streamingTimer = Timer()
-        streamingTimer?.scheduleAtFixedRate(object : TimerTask() {
+    // =========================================================================
+    // CONTINUOUS MONITORING & TRIGGER DETECTION (IT BRIEF SECTION 4 & 6)
+    // =========================================================================
+    private fun startSamplingLoop() {
+        samplingTimer?.cancel()
+        samplingTimer = Timer()
+        samplingTimer?.scheduleAtFixedRate(object : TimerTask() {
             override fun run() {
-                if (!isSensorRunning || isWaitingUserResponse) return
-                if (currentPressure == 0f || !isWsConnected) return
+                if (!isMonitoring || isUserResponding) return
 
-                val nowMs = System.currentTimeMillis()
-                val sensorData = JSONObject().apply {
-                    put("timestamp", nowMs)
-                    put("ax", currentAx)
-                    put("ay", currentAy)
-                    put("az", currentAz)
-                    put("pressure", currentPressure)
-                }
+                val ax = currentAx
+                val ay = currentAy
+                val az = currentAz
+                val now = System.currentTimeMillis()
 
-                val isSent = webSocket?.send(sensorData.toString()) ?: false
-                if (isSent) {
-                    packetCounter++
-                    if (packetCounter % 15 == 0) {
-                        val gForce = sqrt(
-                            (currentAx * currentAx + currentAy * currentAy + currentAz * currentAz).toDouble()
-                        ) / 9.80665
+                val aMagnitudeMs2 = sqrt((ax * ax + ay * ay + az * az).toDouble())
+                val aMagnitudeG = (aMagnitudeMs2 / 9.80665f).toFloat()
 
-                        runOnUiThread {
-                            if (isSensorRunning && !isWaitingUserResponse) {
-                                tvMetrics.text = String.format(
-                                    Locale.US,
-                                    "ACC: %.2f G  |  %.0f hPa",
-                                    gForce, currentPressure
-                                )
+                // Estimasi gravitasi & kalkulasi akselerasi dinamis[cite: 3, 4]
+                estimatedGravity = GRAVITY_ALPHA * aMagnitudeG + (1 - GRAVITY_ALPHA) * estimatedGravity
+                val aDynamic = abs(aMagnitudeG - estimatedGravity)
+
+                val sample = SensorSample(ax, ay, az, now)
+
+                if (!isObservingWindow) {
+                    // Trigger Condition: A_d(t) >= T_TRIGGER (2.0 G)[cite: 4]
+                    if (aDynamic >= TRIGGER_THRESHOLD_G) {
+                        isObservingWindow = true
+                        observationSamples.clear()
+                        observationSamples.add(sample)
+
+                        Log.i(TAG, "Trigger terdeteksi! A_dynamic=${String.format(Locale.US, "%.2f", aDynamic)}G. Memulai observasi 3s...")
+                        setStatusUi("Observing (3s)...", "#D29922")
+                    } else {
+                        uiTick++
+                        if (uiTick % 25 == 0) {
+                            runOnUiThread {
+                                if (isMonitoring && !isObservingWindow && !isUserResponding) {
+                                    tvMetrics.text = String.format(Locale.US, "A_dyn: %.2fG | Monitoring", aDynamic)
+                                }
                             }
                         }
                     }
-                }
-            }
-        }, 0, 40)
-    }
-
-    private fun stopStreamingData() {
-        streamingTimer?.cancel()
-        streamingTimer = null
-    }
-
-    private fun connectWebSocket() {
-        val request = Request.Builder().url(serverWsUrl).build()
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                isWsConnected = true
-                if (!isSensorRunning) {
-                    setStatusUi("Ready to Start", "#FFFFFF")
                 } else {
-                    setStatusUi("Monitoring Active", "#3FB950")
-                }
-            }
+                    // 3-second Post-Trigger Observation (150 samples)[cite: 3, 4]
+                    observationSamples.add(sample)
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                try {
-                    val json = JSONObject(text)
-                    if (json.getString("type") == "POST_EVENT_CHECK") {
-                        val eventId = json.getString("event_id")
-                        val classification = json.optString("classification", "Near-Fall")
+                    val count = observationSamples.size
+                    if (count % 25 == 0) {
                         runOnUiThread {
-                            showPostEventScreen(eventId, classification)
+                            tvMetrics.text = "Observation: $count / $TARGET_SAMPLES"
                         }
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "JSON Parse Error", e)
+
+                    if (count >= TARGET_SAMPLES) {
+                        isObservingWindow = false
+                        val windowCopy = ArrayList(observationSamples)
+                        
+                        setStatusUi("Evaluating...", "#58A6FF")
+                        sendObservationWindowToBackend(windowCopy)
+                    }
                 }
             }
-
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                isWsConnected = false
-                setStatusUi("Disconnected", "#F85149")
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                isWsConnected = false
-                setStatusUi("Connection Failed", "#F85149")
-            }
-        })
+        }, 0, SAMPLE_INTERVAL_MS)
     }
 
-    // Menampilkan Layar Konfirmasi Penuh (Lebih jelas untuk Lansia di Smartwatch)
-    private fun showPostEventScreen(eventId: String, classification: String) {
-        isWaitingUserResponse = true
-        countdownTimer?.cancel()
+    private fun sendObservationWindowToBackend(observationData: List<SensorSample>) {
+        val eventId = UUID.randomUUID().toString()
+        val timestampStr = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).format(Date())
 
-        // Ganti tampilan dari Layar Utama ke Layar Konfirmasi
-        layoutMain.visibility = View.GONE
-        layoutAlert.visibility = View.VISIBLE
+        val xList = JSONArray()
+        val yList = JSONArray()
+        val zList = JSONArray()
 
-        tvAlertTitle.text = "${classification.uppercase()} DETECTED"
-        tvAlertTitle.setTextColor(
-            if (classification == "Fall") Color.parseColor("#F85149") else Color.parseColor("#D29922")
-        )
-
-        btnOk.setOnClickListener {
-            countdownTimer?.cancel()
-            sendResponseToServer(eventId, "OK", classification)
+        for (s in observationData) {
+            xList.put(s.x)
+            yList.put(s.y)
+            zList.put(s.z)
         }
 
-        btnHelp.setOnClickListener {
-            countdownTimer?.cancel()
-            sendResponseToServer(eventId, "NEED_HELP", classification)
-        }
-
-        countdownTimer = object : CountDownTimer(15000, 1000) {
-            override fun onTick(millisUntilFinished: Long) {
-                tvAlertTimer.text = "Are you OK? (${millisUntilFinished / 1000}s)"
-            }
-
-            override fun onFinish() {
-                sendResponseToServer(eventId, "NO_RESPONSE", classification)
-            }
-        }.start()
-    }
-
-    private fun sendResponseToServer(eventId: String, responseType: String, classification: String) {
-        // Kembalikan layar ke tampilan monitoring utama
-        layoutAlert.visibility = View.GONE
-        layoutMain.visibility = View.VISIBLE
-        isWaitingUserResponse = false
-
-        val jsonPayload = JSONObject().apply {
+        // Payload disesuaikan dengan skema Blueprint v1.0 menggunakan observation_window[cite: 3, 4]
+        val payloadJson = JSONObject().apply {
             put("event_id", eventId)
-            put("response_type", responseType)
-            put("classification", classification)
-        }.toString()
+            put("user_id", "00000000-0000-0000-0000-000000000000")
+            put("device_id", "Samsung-Galaxy-Watch4")
+            put("timestamp", timestampStr)
+            put("observation_window", JSONObject().apply {
+                put("x", xList)
+                put("y", yList)
+                put("z", zList)
+            })
+        }
 
-        val body = jsonPayload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
+        val body = payloadJson.toString().toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
         val request = Request.Builder()
-            .url(serverHttpUrl)
+            .url(serverEvaluateUrl)
             .post(body)
             .build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                Log.e(TAG, "Gagal mengirim respons konfirmasi", e)
+                Log.e(TAG, "Gagal mengirim data event ke backend: ${e.message}", e)
+                setStatusUi("Network Error", "#F85149")
             }
+
             override fun onResponse(call: Call, response: Response) {
-                Log.d(TAG, "Respons terkirim: $responseType")
+                val respStr = response.body?.string() ?: ""
+                Log.i(TAG, "Respon Klasifikasi Server: $respStr")
+                try {
+                    val json = JSONObject(respStr)
+                    val eventType = json.optString("event_type", "NORMAL")
+                    
+                    runOnUiThread {
+                        when (eventType) {
+                            "NEAR_FALL" -> showHumanConfirmationInterface("NEAR_FALL")
+                            "FALL" -> showHumanConfirmationInterface("FALL")
+                            else -> setStatusUi("Monitoring (50 Hz)", "#3FB950")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Parse JSON error", e)
+                    setStatusUi("Monitoring (50 Hz)", "#3FB950")
+                }
             }
         })
     }
 
+    // =========================================================================
+    // HUMAN CONFIRMATION SYSTEM (30s TIMEOUT - BLUEPRINT SECTION 10)[cite: 3, 4]
+    // =========================================================================
+    private fun showHumanConfirmationInterface(eventType: String) {
+        isUserResponding = true
+        countDownTimer?.cancel()
+
+        vibrateDevice(longArrayOf(0, 300, 100, 300), true)
+
+        layoutMain.visibility = View.GONE
+        layoutAlert.visibility = View.VISIBLE
+
+        if (eventType == "FALL") {
+            tvAlertTitle.text = "Did you fall?"
+            tvAlertTitle.setTextColor(Color.parseColor("#F85149"))
+        } else {
+            tvAlertTitle.text = "Did you experience a near-fall?"
+            tvAlertTitle.setTextColor(Color.parseColor("#D29922"))
+        }
+
+        btnYes.text = "YES"
+        btnYes.setBackgroundColor(Color.parseColor("#2EA043"))
+
+        btnNo.text = "NO"
+        btnNo.setBackgroundColor(Color.parseColor("#DA3633"))
+
+        btnYes.setOnClickListener {
+            countDownTimer?.cancel()
+            dismissConfirmation("CONFIRMED") // YES -> CONFIRMED[cite: 3, 4]
+        }
+
+        btnNo.setOnClickListener {
+            countDownTimer?.cancel()
+            dismissConfirmation("FALSE_EVENT") // NO -> FALSE_EVENT[cite: 3, 4]
+        }
+
+        // Timeout 30 detik sesuai spesifikasi resmi[cite: 3, 4]
+        countDownTimer = object : CountDownTimer(30000, 1000) {
+            override fun onTick(millisUntilFinished: Long) {
+                tvAlertTimer.text = "Timeout: ${millisUntilFinished / 1000}s"
+            }
+
+            override fun onFinish() {
+                dismissConfirmation("UNCONFIRMED") // Timeout -> UNCONFIRMED[cite: 3, 4]
+            }
+        }.start()
+    }
+
+    private fun dismissConfirmation(confirmationStatus: String) {
+        vibrator?.cancel()
+        layoutAlert.visibility = View.GONE
+        layoutMain.visibility = View.VISIBLE
+        isUserResponding = false
+
+        setStatusUi("Monitoring (50 Hz)", "#3FB950")
+        Log.i(TAG, "Human Confirmation Status Recorded: $confirmationStatus")
+    }
+
+    private fun vibrateDevice(pattern: LongArray, repeat: Boolean) {
+        if (vibrator?.hasVibrator() == true) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(VibrationEffect.createWaveform(pattern, if (repeat) 0 else -1))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(pattern, if (repeat) 0 else -1)
+            }
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        stopStreamingData()
-        sensorManager.unregisterListener(this)
-        countdownTimer?.cancel()
-        webSocket?.close(1000, "Aplikasi ditutup")
+        vibrator?.cancel()
+        stopMonitoring()
     }
 }
