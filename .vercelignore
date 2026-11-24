@@ -1,0 +1,39 @@
+# Build artifacts & dependencies (jangan ikut ter-bundle)
+venv/
+.venv/
+__pycache__/
+*.pyc
+.gradle/
+build/
+app/build/
+
+# Android / WearOS (tidak relevan untuk backend Python)
+WearOS/
+app/
+gradle/
+gradlew
+gradlew.bat
+settings.gradle
+build.gradle
+local.properties
+
+# Log & data sensor lokal (sudah di-supabase)
+*.csv
+*.bak
+note*.txt
+
+# Docker & platform lama
+Dockerfile
+.dockerignore
+.fly/
+
+# Kredensial (dipakai sebagai Environment Variables di Vercel, bukan file)
+.env
+.env.*
+!.env.example
+.env.local
+
+# Git & editor
+.git/
+.gitignore
+.idea/

@@ -61,6 +61,11 @@ FALL_INACTIVITY_THRESHOLD_G = 0.2         # Inactivity dynamic acceleration limi
 
 EVENT_LOG_FILE = "elderguard_official_log.csv"
 
+# Vercel Functions hanya mengizinkan tulis ke /tmp (filesystem proyek read-only).
+# Lokal/Fly.io tetap memakai direktori proyek agar log mudah diperiksa.
+if os.environ.get("VERCEL"):
+    EVENT_LOG_FILE = os.path.join("/tmp", EVENT_LOG_FILE)
+
 EVENT_FIELDS = [
     "id",
     "user_id",
@@ -85,9 +90,13 @@ latest_event_cache = {
 }
 
 def init_csv_logs() -> None:
-    if not os.path.exists(EVENT_LOG_FILE):
-        with open(EVENT_LOG_FILE, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(EVENT_FIELDS)
+    try:
+        if not os.path.exists(EVENT_LOG_FILE):
+            with open(EVENT_LOG_FILE, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(EVENT_FIELDS)
+    except OSError as exc:
+        # Gagal membuat file log tidak boleh menggagalkan startup aplikasi.
+        log.warning("CSV log tidak dapat dibuat (%s); lanjut tanpa log CSV lokal.", exc)
 
 init_csv_logs()
 

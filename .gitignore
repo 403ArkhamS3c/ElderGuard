@@ -32,3 +32,5 @@ WearOS/Note/pass-database.txt
 .env
 .env.*
 !.env.example
+.vercel
+.env*
