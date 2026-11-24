@@ -116,6 +116,45 @@ async def db_insert(table: str, row: dict) -> None:
         log.error("Supabase insert %s gagal: %s", table, exc)
 
 
+# ---------------------------------------------------------------------------
+# Pemetaan ke schema asli tabel `events` di Supabase:
+#   required : event_id (uuid), timestamp (int64 / epoch ms), event_type
+#   optional : user_id (FK -> users.user_id), confidence, duration, response_status
+# Kolom lama di kode (id, device_id, event_timestamp, peak_acceleration,
+# variability, post_activity, confirmation_status, caregiver_notification_status,
+# created_at) tidak ada di tabel tersebut sehingga insert selalu gagal PGRST204.
+# ---------------------------------------------------------------------------
+PLACEHOLDER_USER_ID = "00000000-0000-0000-0000-000000000000"
+DEFAULT_DB_USER_ID = "S01"  # satu-satunya baris di tabel `users`
+
+
+def resolve_db_user_id(user_id: Optional[str]) -> str:
+    """Kembalikan user_id yang valid sebagai foreign key ke tabel `users`.
+
+    Aplikasi mengirim placeholder UUID yang tidak terdaftar di `users`, sehingga
+    Postgrest akan menolak insert dengan pelanggaran FK.
+    """
+    if not user_id or not str(user_id).strip() or str(user_id).strip() == PLACEHOLDER_USER_ID:
+        return DEFAULT_DB_USER_ID
+    return str(user_id).strip()
+
+
+def to_epoch_ms(timestamp_str: str) -> int:
+    """Konversi timestamp ISO-8601 (atau epoch) ke milidetik untuk kolom `timestamp`."""
+    try:
+        dt = datetime.fromisoformat(str(timestamp_str).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        pass
+    try:  # fallback: epoch detik atau milidetik mentah
+        val = float(timestamp_str)
+        return int(val * 1000) if val < 1e11 else int(val)
+    except (ValueError, TypeError):
+        return int(time.time() * 1000)
+
+
 # =====================================================================
 # RULE-BASED CLASSIFICATION ENGINE (3 CLASSES: NORMAL, NEAR_FALL, FALL)
 # =====================================================================
@@ -277,19 +316,13 @@ async def evaluate_event(packet: EventPacket):
         result["reason"],
     ])
 
-    # 2. Sinkronisasi ke Supabase Database (`events` table schema compliance)[cite: 3]
+    # 2. Sinkronisasi ke Supabase Database (disesuaikan dengan schema `events`)
     await db_insert("events", {
-        "id": event_id,
-        "user_id": user_id,
-        "device_id": device_id,
+        "event_id": event_id,
+        "user_id": resolve_db_user_id(user_id),
         "event_type": event_type,
-        "event_timestamp": timestamp_str,
-        "peak_acceleration": result["peak_acceleration"],
-        "variability": result["variability"],
-        "post_activity": result["post_activity"],
-        "confirmation_status": confirmation_status,
-        "caregiver_notification_status": notification_status,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "timestamp": to_epoch_ms(timestamp_str),
+        "response_status": confirmation_status,
     })
 
     return {
