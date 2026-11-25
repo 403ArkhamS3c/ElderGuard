@@ -59,6 +59,19 @@ TRIGGER_THRESHOLD_G = 2.0                 # Dynamic acceleration trigger thresho
 FALL_IMPACT_THRESHOLD_G = 2.3             # Resultant acceleration fall threshold
 FALL_INACTIVITY_THRESHOLD_G = 0.2         # Inactivity dynamic acceleration limit
 
+# --- Konfigurasi endpoint /api/monitoring/latest ---
+# Aplikasi Android hanya mengirim data saat trigger sensor (bukan heartbeat
+# berkala), sehingga perangkat dianggap OFFLINE bila tidak ada event sama
+# sekali dalam batas waktu ini. Threshold TIDAK dipakai untuk mengubah status
+# menjadi NORMAL — hanya untuk menandai perangkat kehilangan koneksi.
+DEVICE_OFFLINE_THRESHOLD_SEC = int(os.getenv("DEVICE_OFFLINE_THRESHOLD_SEC", "600"))
+
+# Tiga klasifikasi utama yang diakui backend (nilai API tidak berubah)
+CANONICAL_EVENT_TYPES = ("NORMAL", "NEAR_FALL", "FALL")
+
+# Event berikut yang dianggap signifikan untuk isi `latest_event`
+SIGNIFICANT_EVENT_TYPES = ("NEAR_FALL", "FALL")
+
 EVENT_LOG_FILE = "elderguard_official_log.csv"
 
 # Vercel Functions hanya mengizinkan tulis ke /tmp (filesystem proyek read-only).
@@ -153,6 +166,56 @@ def to_epoch_ms(timestamp_str: str) -> int:
         return int(val * 1000) if val < 1e11 else int(val)
     except (ValueError, TypeError):
         return int(time.time() * 1000)
+
+
+def to_epoch_sec(ts) -> int:
+    """Konversi kolom `timestamp` (epoch milidetik) ke detik untuk response API."""
+    try:
+        val = int(ts)
+    except (TypeError, ValueError):
+        return int(time.time())
+    return val // 1000 if val > 10_000_000_000 else val
+
+
+def normalize_event_type(raw: Optional[str]) -> str:
+    """Samakan format event_type ke tiga nilai kanonik: NORMAL, NEAR_FALL, FALL.
+
+    Tabel `events` memuat data lama dengan format beragam (mis. "NEAR-FALL",
+    "Fall — No Response", "Near-Fall — Recovered"). Semuanya dipetakan ke
+    kelas utama agar `monitoring_status` selalu memakai nilai API yang benar.
+    """
+    if not raw:
+        return "NORMAL"
+    text = str(raw).strip().upper().replace("-", "_").replace(" ", "_")
+    if text.startswith("NEAR_FALL") or text.startswith("NEARFALL"):
+        return "NEAR_FALL"
+    if text.startswith("FALL"):
+        return "FALL"
+    if text.startswith("NORMAL") or text.startswith("MONITORING"):
+        return "NORMAL"
+    return str(raw).strip().upper()
+
+
+async def db_fetch_recent_events(limit: int = 100) -> list:
+    """Ambil event terbaru diurutkan dari yang paling baru (paling baru dulu).
+
+    Dibaca langsung dari Supabase agar status tetap akurat pada Vercel
+    Functions (multi-instance + cold start), bukan dari cache in-memory.
+    """
+    if supabase is None:
+        return []
+    try:
+        res = await asyncio.to_thread(
+            lambda: supabase.table("events")
+            .select("event_id, user_id, event_type, timestamp, peak_acceleration")
+            .order("timestamp", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return getattr(res, "data", None) or []
+    except Exception as exc:
+        log.warning("Gagal membaca events dari Supabase: %s", exc)
+        return []
 
 
 # =====================================================================
@@ -323,6 +386,7 @@ async def evaluate_event(packet: EventPacket):
         "event_type": event_type,
         "timestamp": to_epoch_ms(timestamp_str),
         "response_status": confirmation_status,
+        "peak_acceleration": result["peak_acceleration"],
     })
 
     return {
@@ -340,9 +404,97 @@ async def evaluate_event(packet: EventPacket):
 @app.get("/api/monitoring/latest")
 async def get_latest_monitoring():
     """
-    Mengembalikan data deteksi kejadian terbaru untuk pemantauan pada aplikasi Android (Caregiver/Frontend).
+    Menyediakan status monitoring TERKINI (bukan sekadar event terakhir).
+
+    Format:
+      user_id, monitoring_status, status_updated_at, last_seen_at,
+      device_online, latest_event{event_id, event_type, timestamp, peak_acceleration}
+
+    Ketentuan:
+      - monitoring_status mengikuti klasifikasi terbaru dari smartwatch
+        (NORMAL / NEAR_FALL / FALL). Status TIDAK pernah diubah menjadi NORMAL
+        hanya berdasarkan timer.
+      - Bila perangkat tidak mengirim event melewati DEVICE_OFFLINE_THRESHOLD_SEC,
+        maka device_online=False dan monitoring_status="UNKNOWN".
+      - latest_event berisi event NEAR_FALL/FALL terakhir (riwayat). Riwayat
+        tidak pernah dihapus ketika status kembali NORMAL.
     """
-    return latest_event_cache
+    now = int(time.time())
+
+    # --- Sumber data utama: Supabase (andalan pada serverless multi-instance) ---
+    rows = await db_fetch_recent_events()
+    if rows:
+        latest = rows[0]
+        user_id = resolve_db_user_id(latest.get("user_id"))
+        last_seen_at = to_epoch_sec(latest.get("timestamp"))
+        device_online = (now - last_seen_at) <= DEVICE_OFFLINE_THRESHOLD_SEC
+
+        # Status = hasil klasifikasi terbaru dari smartwatch
+        monitoring_status = normalize_event_type(latest.get("event_type"))
+
+        # status_updated_at = awal rentetan event dengan tipe sama
+        # (waktu terakhir kali status benar-benar berubah)
+        status_updated_at = last_seen_at
+        for row in rows[1:]:
+            if normalize_event_type(row.get("event_type")) != monitoring_status:
+                break
+            status_updated_at = to_epoch_sec(row.get("timestamp"))
+
+        if not device_online:
+            # Kehilangan koneksi -> UNKNOWN, bukan NORMAL (ketentuan butir 4)
+            monitoring_status = "UNKNOWN"
+            status_updated_at = last_seen_at + DEVICE_OFFLINE_THRESHOLD_SEC
+
+        # Riwayat signifikan terakhir: NEAR_FALL atau FALL saja
+        significant = next(
+            (
+                r for r in rows
+                if normalize_event_type(r.get("event_type")) in SIGNIFICANT_EVENT_TYPES
+            ),
+            None,
+        )
+        latest_event = None
+        if significant is not None:
+            latest_event = {
+                "event_id": significant.get("event_id"),
+                "event_type": normalize_event_type(significant.get("event_type")),
+                "timestamp": to_epoch_sec(significant.get("timestamp")),
+                "peak_acceleration": significant.get("peak_acceleration"),
+            }
+
+        return {
+            "user_id": user_id,
+            "monitoring_status": monitoring_status,
+            "status_updated_at": status_updated_at,
+            "last_seen_at": last_seen_at,
+            "device_online": device_online,
+            "latest_event": latest_event,
+        }
+
+    # --- Fallback: Supabase tidak tersedia (mode lokal tanpa kredensial) ---
+    cache = latest_event_cache
+    last_seen_at = to_epoch_sec(cache.get("timestamp"))
+    device_online = (now - last_seen_at) <= DEVICE_OFFLINE_THRESHOLD_SEC
+    cached_type = normalize_event_type(cache.get("event_type"))
+    has_event = cache.get("event_id") not in (None, "EVT-NONE")
+
+    return {
+        "user_id": resolve_db_user_id(cache.get("user_id")),
+        "monitoring_status": cached_type if device_online else "UNKNOWN",
+        "status_updated_at": last_seen_at,
+        "last_seen_at": last_seen_at,
+        "device_online": device_online,
+        "latest_event": (
+            {
+                "event_id": cache.get("event_id"),
+                "event_type": cached_type,
+                "timestamp": last_seen_at,
+                "peak_acceleration": cache.get("peak_acceleration"),
+            }
+            if has_event and cached_type in SIGNIFICANT_EVENT_TYPES
+            else None
+        ),
+    }
 
 
 @app.get("/health")
