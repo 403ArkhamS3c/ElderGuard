@@ -66,6 +66,12 @@ FALL_INACTIVITY_THRESHOLD_G = 0.2         # Inactivity dynamic acceleration limi
 # menjadi NORMAL — hanya untuk menandai perangkat kehilangan koneksi.
 DEVICE_OFFLINE_THRESHOLD_SEC = int(os.getenv("DEVICE_OFFLINE_THRESHOLD_SEC", "600"))
 
+# Toleransi clock-skew perangkat (detik). Event dengan timestamp lebih dari
+# ini di masa depan dianggap jam perangkat salah (mis. waktu lokal ditulis
+# dengan huruf 'Z') sehingga TIDAK dipakai untuk menentukan status/last_seen.
+# Data tetap tersimpan utuh di Supabase (riwayat tidak dihapus/diubah).
+FUTURE_TIMESTAMP_TOLERANCE_SEC = 60
+
 # Tiga klasifikasi utama yang diakui backend (nilai API tidak berubah)
 CANONICAL_EVENT_TYPES = ("NORMAL", "NEAR_FALL", "FALL")
 
@@ -153,19 +159,26 @@ def resolve_db_user_id(user_id: Optional[str]) -> str:
 
 
 def to_epoch_ms(timestamp_str: str) -> int:
-    """Konversi timestamp ISO-8601 (atau epoch) ke milidetik untuk kolom `timestamp`."""
+    """Konversi timestamp ISO-8601 (atau epoch) ke milidetik untuk kolom `timestamp`.
+
+    Timestamp yang berada di MASA DEPAN (jam perangkat maju / salah zona waktu)
+    di-clamp ke waktu server saat ini, agar urutan event dan `last_seen_at`
+    tidak pernah dibajak oleh clock-skew perangkat. Timestamp masa lalu tetap
+    disimpan apa adanya.
+    """
+    now_ms = int(time.time() * 1000)
     try:
         dt = datetime.fromisoformat(str(timestamp_str).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() * 1000)
+        ms = int(dt.timestamp() * 1000)
     except (ValueError, TypeError):
-        pass
-    try:  # fallback: epoch detik atau milidetik mentah
-        val = float(timestamp_str)
-        return int(val * 1000) if val < 1e11 else int(val)
-    except (ValueError, TypeError):
-        return int(time.time() * 1000)
+        try:  # fallback: epoch detik atau milidetik mentah
+            val = float(timestamp_str)
+            ms = int(val * 1000) if val < 1e11 else int(val)
+        except (ValueError, TypeError):
+            ms = now_ms
+    return ms if ms <= now_ms else now_ms
 
 
 def to_epoch_sec(ts) -> int:
@@ -216,6 +229,49 @@ async def db_fetch_recent_events(limit: int = 100) -> list:
     except Exception as exc:
         log.warning("Gagal membaca events dari Supabase: %s", exc)
         return []
+
+
+async def db_upsert_last_seen(user_id: str, epoch_sec: int) -> bool:
+    """Catat `last_seen_at` perangkat (waktu SERVER) ke tabel `device_heartbeats`.
+
+    Dipanggil oleh endpoint heartbeat dan setiap evaluate event, sehingga
+    `last_seen_at`/`device_online` diperbarui secara independen dari klasifikasi
+    dan kebal terhadap jam perangkat yang maju/mundur.
+    """
+    if supabase is None:
+        return False
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.table("device_heartbeats")
+            .upsert({"user_id": user_id, "last_seen_at": epoch_sec}, on_conflict="user_id")
+            .execute()
+        )
+        return True
+    except Exception as exc:
+        log.warning("Gagal upsert heartbeat %s: %s", user_id, exc)
+        return False
+
+
+async def db_fetch_last_seen() -> Optional[int]:
+    """Ambil `last_seen_at` terbaru (epoch detik, waktu server) dari heartbeat."""
+    if supabase is None:
+        return None
+    try:
+        res = await asyncio.to_thread(
+            lambda: supabase.table("device_heartbeats")
+            .select("last_seen_at")
+            .order("last_seen_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        data = getattr(res, "data", None) or []
+        if not data:
+            return None
+        val = int(data[0].get("last_seen_at") or 0)
+        return val if val > 0 else None
+    except Exception as exc:
+        log.warning("Gagal membaca heartbeat dari Supabase: %s", exc)
+        return None
 
 
 # =====================================================================
@@ -389,6 +445,10 @@ async def evaluate_event(packet: EventPacket):
         "peak_acceleration": result["peak_acceleration"],
     })
 
+    # 3. Perbarui last_seen_at dengan WAKTU SERVER (independen dari klasifikasi
+    #    dan dari timestamp perangkat yang bisa maju/mundur)
+    await db_upsert_last_seen(resolve_db_user_id(user_id), int(time.time()))
+
     return {
         "status": "success",
         "event_id": event_id,
@@ -421,46 +481,90 @@ async def get_latest_monitoring():
     """
     now = int(time.time())
 
+    # --- Fallback: Supabase tidak tersedia (mode lokal tanpa kredensial) ---
+    if supabase is None:
+        cache = latest_event_cache
+        last_seen_at = to_epoch_sec(cache.get("timestamp"))
+        device_online = (now - last_seen_at) <= DEVICE_OFFLINE_THRESHOLD_SEC
+        cached_type = normalize_event_type(cache.get("event_type"))
+        has_event = cache.get("event_id") not in (None, "EVT-NONE")
+
+        return {
+            "user_id": resolve_db_user_id(cache.get("user_id")),
+            "monitoring_status": cached_type if device_online else "UNKNOWN",
+            "status_updated_at": last_seen_at,
+            "last_seen_at": last_seen_at,
+            "device_online": device_online,
+            "latest_event": (
+                {
+                    "event_id": cache.get("event_id"),
+                    "event_type": cached_type,
+                    "timestamp": last_seen_at,
+                    "peak_acceleration": cache.get("peak_acceleration"),
+                }
+                if has_event and cached_type in SIGNIFICANT_EVENT_TYPES
+                else None
+            ),
+        }
+
     # --- Sumber data utama: Supabase (andalan pada serverless multi-instance) ---
-    rows = await db_fetch_recent_events()
+    all_rows = await db_fetch_recent_events()
+    heartbeat = await db_fetch_last_seen()
+
+    # Event ber-timestamp di masa depan (clock-skew perangkat, mis. waktu lokal
+    # ditulis dengan huruf 'Z') tidak dipakai untuk status/last_seen — tapi
+    # tetap tersimpan utuh di database sebagai riwayat (tidak dihapus/diubah).
+    rows = [
+        r for r in all_rows
+        if to_epoch_sec(r.get("timestamp")) <= now + FUTURE_TIMESTAMP_TOLERANCE_SEC
+    ]
+
+    # Riwayat signifikan diambil dari SELURUH baris (termasuk yang clock-skew)
+    # agar event NEAR_FALL/FALL terakhir tidak pernah hilang dari `latest_event`.
+    significant = next(
+        (
+            r for r in all_rows
+            if normalize_event_type(r.get("event_type")) in SIGNIFICANT_EVENT_TYPES
+        ),
+        None,
+    )
+    latest_event = None
+    if significant is not None:
+        latest_event = {
+            "event_id": significant.get("event_id"),
+            "event_type": normalize_event_type(significant.get("event_type")),
+            "timestamp": to_epoch_sec(significant.get("timestamp")),
+            "peak_acceleration": significant.get("peak_acceleration"),
+        }
+
     if rows:
         latest = rows[0]
         user_id = resolve_db_user_id(latest.get("user_id"))
-        last_seen_at = to_epoch_sec(latest.get("timestamp"))
+        event_last_seen = to_epoch_sec(latest.get("timestamp"))
+
+        # last_seen_at = event valid terakhir ATAU heartbeat, mana yang lebih
+        # baru. Heartbeat memperbaruinya secara independen (butir 6) dan selalu
+        # memakai waktu server sehingga kebal clock-skew perangkat.
+        last_seen_at = event_last_seen if heartbeat is None else max(event_last_seen, heartbeat)
         device_online = (now - last_seen_at) <= DEVICE_OFFLINE_THRESHOLD_SEC
 
-        # Status = hasil klasifikasi terbaru dari smartwatch
+        # Status = hasil klasifikasi sensor TERBARU yang valid (butir 1-4 & 8):
+        # NORMAL mengembalikan status ke NORMAL. Tidak ada timer yang mengubah
+        # status; ketidakadaan event tidak pernah dianggap NORMAL.
         monitoring_status = normalize_event_type(latest.get("event_type"))
 
-        # status_updated_at = awal rentetan event dengan tipe sama
-        # (waktu terakhir kali status benar-benar berubah)
-        status_updated_at = last_seen_at
+        # status_updated_at = awal rentetan event dengan tipe sama (butir 7):
+        # diperbarui hanya ketika status monitoring benar-benar berubah.
+        status_updated_at = event_last_seen
         for row in rows[1:]:
             if normalize_event_type(row.get("event_type")) != monitoring_status:
                 break
             status_updated_at = to_epoch_sec(row.get("timestamp"))
 
         if not device_online:
-            # Kehilangan koneksi -> UNKNOWN, bukan NORMAL (ketentuan butir 4)
+            # Kehilangan koneksi -> UNKNOWN, bukan NORMAL (butir 8)
             monitoring_status = "UNKNOWN"
             status_updated_at = last_seen_at + DEVICE_OFFLINE_THRESHOLD_SEC
-
-        # Riwayat signifikan terakhir: NEAR_FALL atau FALL saja
-        significant = next(
-            (
-                r for r in rows
-                if normalize_event_type(r.get("event_type")) in SIGNIFICANT_EVENT_TYPES
-            ),
-            None,
-        )
-        latest_event = None
-        if significant is not None:
-            latest_event = {
-                "event_id": significant.get("event_id"),
-                "event_type": normalize_event_type(significant.get("event_type")),
-                "timestamp": to_epoch_sec(significant.get("timestamp")),
-                "peak_acceleration": significant.get("peak_acceleration"),
-            }
 
         return {
             "user_id": user_id,
@@ -471,29 +575,41 @@ async def get_latest_monitoring():
             "latest_event": latest_event,
         }
 
-    # --- Fallback: Supabase tidak tersedia (mode lokal tanpa kredensial) ---
-    cache = latest_event_cache
-    last_seen_at = to_epoch_sec(cache.get("timestamp"))
-    device_online = (now - last_seen_at) <= DEVICE_OFFLINE_THRESHOLD_SEC
-    cached_type = normalize_event_type(cache.get("event_type"))
-    has_event = cache.get("event_id") not in (None, "EVT-NONE")
-
+    # Tidak ada klasifikasi valid sama sekali (semua event clock-skew / kosong)
+    last_seen_at = heartbeat if heartbeat is not None else 0
+    device_online = heartbeat is not None and (now - heartbeat) <= DEVICE_OFFLINE_THRESHOLD_SEC
     return {
-        "user_id": resolve_db_user_id(cache.get("user_id")),
-        "monitoring_status": cached_type if device_online else "UNKNOWN",
+        "user_id": DEFAULT_DB_USER_ID,
+        "monitoring_status": "UNKNOWN",
         "status_updated_at": last_seen_at,
         "last_seen_at": last_seen_at,
         "device_online": device_online,
-        "latest_event": (
-            {
-                "event_id": cache.get("event_id"),
-                "event_type": cached_type,
-                "timestamp": last_seen_at,
-                "peak_acceleration": cache.get("peak_acceleration"),
-            }
-            if has_event and cached_type in SIGNIFICANT_EVENT_TYPES
-            else None
-        ),
+        "latest_event": latest_event,
+    }
+
+
+class HeartbeatPacket(BaseModel):
+    user_id: Optional[str] = None
+
+
+@app.post("/api/monitoring/heartbeat")
+async def monitoring_heartbeat(packet: Optional[HeartbeatPacket] = None):
+    """
+    Heartbeat perangkat: memperbarui `last_seen_at` & `device_online` dengan
+    WAKTU SERVER secara independen dari klasifikasi (butir 6).
+
+    - Tidak mempengaruhi `monitoring_status` sama sekali (butir 8): keadaan
+      diam tidak pernah dianggap NORMAL maupun di-reset.
+    - Aman terhadap clock-skew perangkat karena selalu memakai waktu server.
+    """
+    user_id = resolve_db_user_id(packet.user_id if packet else None)
+    last_seen_at = int(time.time())
+    recorded = await db_upsert_last_seen(user_id, last_seen_at)
+    return {
+        "user_id": user_id,
+        "last_seen_at": last_seen_at,
+        "device_online": True,
+        "recorded": recorded,
     }
 
 
